@@ -51,6 +51,11 @@
     "st(1, if(between(ld(0),0,1), 0.5-0.5*cos(2*PI*ld(0)), 0));" \
     "r(1-ld(1)) + b(ld(1))"
 #define CSCHEME         "1|0.5|0|0|0.5|1"
+
+#define STOREPATH       "/home/${USER}/CQTData/latest.txt"
+#define NO_DATA         0
+#define NO_VIDEO        1
+
 #define PTS_STEP 10
 #define PTS_TOLERANCE 1
 
@@ -100,6 +105,9 @@ static const AVOption showcqt_options[] = {
         { "smpte240m",     "smpte240m", 0,                  AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_SMPTE240M },   0, 0, FLAGS, "csp" },
         { "bt2020ncl",     "bt2020ncl", 0,                  AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT2020_NCL },  0, 0, FLAGS, "csp" },
     { "cscheme",    "set color scheme", OFFSET(cscheme),   AV_OPT_TYPE_STRING, { .str = CSCHEME },   0, 0, FLAGS },
+    { "storepath",    "set data store", OFFSET(storefile),   AV_OPT_TYPE_STRING, { .str = STOREPATH },   0, 0, FLAGS },
+    { "no_video",              "do not render video", OFFSET(no_video),        AV_OPT_TYPE_BOOL, { .i64 = NO_VIDEO },                0, 1,        FLAGS },
+    { "no_data",              "do not write data", OFFSET(no_data),        AV_OPT_TYPE_BOOL, { .i64 = NO_DATA },                0, 1,        FLAGS },
     { NULL }
 };
 
@@ -430,6 +438,18 @@ error:
     av_frame_free(&s->axis_frame);
     av_freep(tmp_data);
     return ret;
+}
+
+static int init_data_store(struct ShowCQTContext *s)
+{
+    s->data_store = fopen((const char*)s->storefile, "wb");
+    if (!s->data_store) {
+        av_log(s->ctx, AV_LOG_ERROR, "Could not initialize a file pointer; not recording data \n");
+        return AVERROR(ENOMEM);
+    }
+
+    return 0;
+
 }
 
 static double midi(void *p, double f)
@@ -1132,12 +1152,14 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
     ShowCQTContext *s = ctx->priv;
     int64_t last_time, cur_time;
 
+
 #define UPDATE_TIME(t) \
     cur_time = av_gettime(); \
     t += cur_time - last_time; \
     last_time = cur_time
 
     last_time = av_gettime();
+    static int64_t idx = 0;
 
     memcpy(s->fft_result, s->fft_data, s->fft_len * sizeof(*s->fft_data));
     if (s->attack_data) {
@@ -1155,44 +1177,55 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
 
     s->cqt_calc(s->cqt_result, s->fft_result, s->coeffs, s->cqt_len, s->fft_len);
     UPDATE_TIME(s->cqt_time);
-
-    process_cqt(s);
-    UPDATE_TIME(s->process_cqt_time);
-
-    if (s->sono_h) {
-        s->update_sono(s->sono_frame, s->c_buf, s->sono_idx);
-        UPDATE_TIME(s->update_sono_time);
+    if(s->data_store)
+    {
+        for (int i = 0; i < s->cqt_len; ++i) {
+            double magnitude = sqrtf(
+                    s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+            fprintf(s->data_store, "%lf\t", magnitude);
+        }
+        fprintf(s->data_store, "\n");
     }
-
-    if (!s->sono_count) {
-        AVFrame *out = *frameout = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-        if (!out)
-            return AVERROR(ENOMEM);
-        out->sample_aspect_ratio = av_make_q(1, 1);
-        out->color_range = AVCOL_RANGE_MPEG;
-        out->colorspace = s->csp;
-        UPDATE_TIME(s->alloc_time);
-
-        if (s->bar_h) {
-            s->draw_bar(out, s->h_buf, s->rcp_h_buf, s->c_buf, s->bar_h, s->bar_t);
-            UPDATE_TIME(s->bar_time);
-        }
-
-        if (s->axis_h) {
-            s->draw_axis(out, s->axis_frame, s->c_buf, s->bar_h);
-            UPDATE_TIME(s->axis_time);
-        }
+    if(!s->no_video) {
+//        av_log(s->ctx, AV_LOG_INFO, "Frame for cqt time %ld, index %ld\n", last_time, ++idx);
+        process_cqt(s);
+        UPDATE_TIME(s->process_cqt_time);
 
         if (s->sono_h) {
-            s->draw_sono(out, s->sono_frame, s->bar_h + s->axis_h, s->sono_idx);
-            UPDATE_TIME(s->sono_time);
+            s->update_sono(s->sono_frame, s->c_buf, s->sono_idx);
+            UPDATE_TIME(s->update_sono_time);
         }
-        out->pts = s->next_pts;
-        s->next_pts += PTS_STEP;
+
+        if (!s->sono_count) {
+            AVFrame *out = *frameout = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+            if (!out)
+                return AVERROR(ENOMEM);
+            out->sample_aspect_ratio = av_make_q(1, 1);
+            out->color_range = AVCOL_RANGE_MPEG;
+            out->colorspace = s->csp;
+            UPDATE_TIME(s->alloc_time);
+
+            if (s->bar_h) {
+                s->draw_bar(out, s->h_buf, s->rcp_h_buf, s->c_buf, s->bar_h, s->bar_t);
+                UPDATE_TIME(s->bar_time);
+            }
+
+            if (s->axis_h) {
+                s->draw_axis(out, s->axis_frame, s->c_buf, s->bar_h);
+                UPDATE_TIME(s->axis_time);
+            }
+
+            if (s->sono_h) {
+                s->draw_sono(out, s->sono_frame, s->bar_h + s->axis_h, s->sono_idx);
+                UPDATE_TIME(s->sono_time);
+            }
+            out->pts = s->next_pts;
+            s->next_pts += PTS_STEP;
+        }
+        s->sono_count = (s->sono_count + 1) % s->count;
+        if (s->sono_h)
+            s->sono_idx = (s->sono_idx + s->sono_h - 1) % s->sono_h;
     }
-    s->sono_count = (s->sono_count + 1) % s->count;
-    if (s->sono_h)
-        s->sono_idx = (s->sono_idx + s->sono_h - 1) % s->sono_h;
     return 0;
 }
 
@@ -1268,6 +1301,9 @@ static av_cold int init(AVFilterContext *ctx)
         s->height /= 2;
         s->fullhd = 1;
     }
+
+    if(!s->no_data)
+        init_data_store(s);
 
     if (s->axis_h < 0) {
         s->axis_h = s->width / 60;
@@ -1486,6 +1522,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     int remaining, step, ret, x, i, j, m;
     float *audio_data;
     AVFrame *out = NULL;
+    static int64_t frame_idx = -1;
 
     if (!insamples) {
         while (s->remaining_fill < s->remaining_fill_max) {
@@ -1503,10 +1540,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             if (out)
                 return ff_filter_frame(outlink, out);
         }
+        if(!s->no_data)
+            fclose(s->data_store);
         return AVERROR_EOF;
     }
 
-    remaining = insamples->nb_samples;
+    remaining = insamples->nb_samples; ++frame_idx;
     audio_data = (float*) insamples->data[0];
 
     while (remaining) {
@@ -1517,6 +1556,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
                 s->fft_data[j+m].re = audio_data[2*(i+m)];
                 s->fft_data[j+m].im = audio_data[2*(i+m)+1];
             }
+//            av_log(ctx, AV_LOG_INFO, "Frame index: %ld, Samples: %d\n", frame_idx, i);
+            if(!s->no_data)
+                fprintf(s->data_store, "%ld\t%d\t", frame_idx, i);
             ret = plot_cqt(ctx, &out);
             if (ret < 0) {
                 av_frame_free(&insamples);
@@ -1554,6 +1596,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             s->remaining_fill -= remaining;
             remaining = 0;
         }
+
     }
     av_frame_free(&insamples);
     return 0;

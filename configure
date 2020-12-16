@@ -3743,7 +3743,7 @@ doc_deps_any="manpages htmlpages podpages txtpages"
 logfile="ffbuild/config.log"
 
 # installation paths
-prefix_default="/usr/local"
+prefix_default="/home/abhisheknandekar/libav"
 bindir_default='${prefix}/bin'
 datadir_default='${prefix}/share/ffmpeg'
 docdir_default='${prefix}/share/doc/ffmpeg'

@@ -75,6 +75,7 @@ typedef struct ShowCQTContext {
     float               *bar_v_buf;
     float               cmatrix[3][3];
     float               cscheme_v[6];
+    FILE*               data_store;
     /* callback */
     void                (*cqt_calc)(FFTComplex *dst, const FFTComplex *src, const Coeffs *coeffs,
                                     int len, int fft_len);
@@ -117,6 +118,9 @@ typedef struct ShowCQTContext {
     char                *font;
     char                *fontcolor;
     char                *axisfile;
+    char                *storefile;
+    int                 no_video;
+    int                 no_data;
     int                 axis;
     int                 csp;
     char                *cscheme;
