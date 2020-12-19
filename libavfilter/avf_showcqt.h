@@ -89,6 +89,7 @@ typedef struct ShowCQTContext {
     int64_t             fft_time;
     int64_t             cqt_time;
     int64_t             process_cqt_time;
+    int64_t             pre_process_cqt_time;
     int64_t             update_sono_time;
     int64_t             alloc_time;
     int64_t             bar_time;

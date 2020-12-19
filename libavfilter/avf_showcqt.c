@@ -26,6 +26,7 @@
 #include "libavutil/eval.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/time.h"
+#include "libavutil/qsort.h"
 #include "avfilter.h"
 #include "internal.h"
 #include "lavfutils.h"
@@ -125,6 +126,8 @@ static void common_uninit(ShowCQTContext *s)
         av_log(s->ctx, level, "cqt_time         = %16.3f s.\n", s->cqt_time * 1e-6);
     if (s->process_cqt_time)
         av_log(s->ctx, level, "process_cqt_time = %16.3f s.\n", s->process_cqt_time * 1e-6);
+    if (s->pre_process_cqt_time)
+        av_log(s->ctx, level, "pre_process_cqt_time = %16.3f s.\n", s->pre_process_cqt_time * 1e-6);
     if (s->update_sono_time)
         av_log(s->ctx, level, "update_sono_time = %16.3f s.\n", s->update_sono_time * 1e-6);
     if (s->alloc_time)
@@ -136,12 +139,12 @@ static void common_uninit(ShowCQTContext *s)
     if (s->sono_time)
         av_log(s->ctx, level, "sono_time        = %16.3f s.\n", s->sono_time * 1e-6);
 
-    plot_time = s->fft_time + s->cqt_time + s->process_cqt_time + s->update_sono_time
+    plot_time = s->fft_time + s->cqt_time + s->process_cqt_time + s->pre_process_cqt_time + s->update_sono_time
               + s->alloc_time + s->bar_time + s->axis_time + s->sono_time;
     if (plot_time)
         av_log(s->ctx, level, "plot_time        = %16.3f s.\n", plot_time * 1e-6);
 
-    s->fft_time = s->cqt_time = s->process_cqt_time = s->update_sono_time
+    s->fft_time = s->cqt_time = s->process_cqt_time = s->pre_process_cqt_time = s->update_sono_time
                 = s->alloc_time = s->bar_time = s->axis_time = s->sono_time = 0;
     /* axis_frame may be non reference counted frame */
     if (s->axis_frame && !s->axis_frame->buf[0]) {
@@ -232,6 +235,13 @@ static double c_weighting(void *p, double f)
     ret /= (f*f + 20.6*20.6) * (f*f + 12200.0*12200.0);
     return ret;
 }
+
+
+static double midi(void *p, double f)
+{
+    return log2(f/440.0) * 12.0 + 69.0;
+}
+
 
 static int init_volume(ShowCQTContext *s)
 {
@@ -349,6 +359,7 @@ static int init_cqt(ShowCQTContext *s)
 
         if (s->permute_coeffs)
             s->permute_coeffs(s->coeffs[m].val, s->coeffs[m].len);
+        av_log(s->ctx, AV_LOG_INFO, "flen %.3lf, center %.3lf, tlength %.3lf, frequency %3lf index %d midi %.3lf\n", flen, center, tlength, s->freq[k], k, midi(s->ctx, s->freq[k]));
     }
 
     av_expr_free(expr);
@@ -450,11 +461,6 @@ static int init_data_store(struct ShowCQTContext *s)
 
     return 0;
 
-}
-
-static double midi(void *p, double f)
-{
-    return log2(f/440.0) * 12.0 + 69.0;
 }
 
 static double r_func(void *p, double x)
@@ -1139,11 +1145,52 @@ static void process_cqt(ShowCQTContext *s)
             s->cqt_result[x].im = rcp_fcount * result.im;
         }
     }
+    if(!s->no_video)
+    {
+        if (s->format == AV_PIX_FMT_RGB24)
+            rgb_from_cqt(s->c_buf, s->cqt_result, s->sono_g, s->width, s->cscheme_v);
+        else
+            yuv_from_cqt(s->c_buf, s->cqt_result, s->sono_g, s->width, s->cmatrix, s->cscheme_v);
+    }
+}
 
-    if (s->format == AV_PIX_FMT_RGB24)
-        rgb_from_cqt(s->c_buf, s->cqt_result, s->sono_g, s->width, s->cscheme_v);
-    else
-        yuv_from_cqt(s->c_buf, s->cqt_result, s->sono_g, s->width, s->cmatrix, s->cscheme_v);
+static void pre_process_cqt(ShowCQTContext* s)
+{
+    int num_sign = 0;
+    static int* last_sign_bit;
+    int* current_signs;
+    if(!last_sign_bit)
+        last_sign_bit = av_calloc(s->cqt_len, sizeof(*last_sign_bit));
+    current_signs = av_calloc(s->cqt_len, sizeof(*current_signs));
+
+    for (int i = 1; i < s->cqt_len; ++i) {
+        double magnitude = sqrtf(
+                s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+        if( /*i <= 583 ||*/ magnitude <= 0.005)
+        {
+            s->cqt_result[i].re = 0;
+            s->cqt_result[i].im = 0;
+            current_signs[i] = 0;
+        }else{
+            current_signs[i] = 1;
+            ++num_sign;
+        }
+    }
+
+    if(num_sign > 300)
+    {
+        for(int i = 0; i < s->cqt_len; ++i)
+        {
+            if(last_sign_bit[i] != 1)
+            {
+                s->cqt_result[i].re = 0;
+                s->cqt_result[i].im = 0;
+            }
+        }
+    }
+    else {
+        last_sign_bit = current_signs;
+    }
 }
 
 static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
@@ -1159,7 +1206,6 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
     last_time = cur_time
 
     last_time = av_gettime();
-    static int64_t idx = 0;
 
     memcpy(s->fft_result, s->fft_data, s->fft_len * sizeof(*s->fft_data));
     if (s->attack_data) {
@@ -1177,6 +1223,51 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
 
     s->cqt_calc(s->cqt_result, s->fft_result, s->coeffs, s->cqt_len, s->fft_len);
     UPDATE_TIME(s->cqt_time);
+
+
+
+        pre_process_cqt(s);
+        UPDATE_TIME(s->pre_process_cqt_time);
+/*
+        // *  Only Max intensity display:
+        double max_mag = sqrtf(s->cqt_result[0].re * s->cqt_result[0].re + s->cqt_result[0].im * s->cqt_result[0].im);
+        int max_max_index = 0;
+        for (int i = 1; i < s->cqt_len; ++i) {
+            double magnitude = sqrtf(
+                    s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+            if(magnitude >= max_mag)
+            {
+                max_mag = magnitude;
+                max_max_index  = i;
+            }
+        }
+        for(int i = 0; i < s->cqt_len; ++i)
+        {
+            if(i != max_max_index)
+            {
+                s->cqt_result[i].re = 0;
+                s->cqt_result[i].im = 0;
+            }
+        }*/
+//        av_log(s->ctx, AV_LOG_INFO, "Frame for cqt time %ld, index %ld\n", last_time, ++idx);
+
+
+/*
+        else {
+            for(int i = 0; i < s->cqt_len; ++i)
+                last_sign_bit[i] = s->cqt_result[i];
+        }
+*/
+
+        process_cqt(s);
+        UPDATE_TIME(s->process_cqt_time);
+
+/*
+
+        int* counts = (int*)av_calloc(s->cqt_len, sizeof (int));
+        for(int i = 0 ; i < s->cqt_len; ++i)
+            counts[i] = 0;
+*/
     if(s->data_store)
     {
         for (int i = 0; i < s->cqt_len; ++i) {
@@ -1186,11 +1277,8 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
         }
         fprintf(s->data_store, "\n");
     }
-    if(!s->no_video) {
-//        av_log(s->ctx, AV_LOG_INFO, "Frame for cqt time %ld, index %ld\n", last_time, ++idx);
-        process_cqt(s);
-        UPDATE_TIME(s->process_cqt_time);
 
+    if(!s->no_video) {
         if (s->sono_h) {
             s->update_sono(s->sono_frame, s->c_buf, s->sono_idx);
             UPDATE_TIME(s->update_sono_time);
@@ -1558,7 +1646,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             }
 //            av_log(ctx, AV_LOG_INFO, "Frame index: %ld, Samples: %d\n", frame_idx, i);
             if(!s->no_data)
-                fprintf(s->data_store, "%ld\t%d\t", frame_idx, i);
+            {
+                double timestamp = (double) (frame_idx * insamples->nb_samples + i) /  insamples->sample_rate;
+                fprintf(s->data_store, "%lf\t", timestamp);
+            }
             ret = plot_cqt(ctx, &out);
             if (ret < 0) {
                 av_frame_free(&insamples);
