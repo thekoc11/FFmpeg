@@ -76,6 +76,7 @@ typedef struct ShowCQTContext {
     float               cmatrix[3][3];
     float               cscheme_v[6];
     FILE*               data_store;
+    FILE*               midi_data_store;
     /* callback */
     void                (*cqt_calc)(FFTComplex *dst, const FFTComplex *src, const Coeffs *coeffs,
                                     int len, int fft_len);

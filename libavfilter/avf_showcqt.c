@@ -112,7 +112,9 @@ static const AVOption showcqt_options[] = {
     { NULL }
 };
 
+
 AVFILTER_DEFINE_CLASS(showcqt);
+
 
 static void common_uninit(ShowCQTContext *s)
 {
@@ -453,8 +455,12 @@ error:
 
 static int init_data_store(struct ShowCQTContext *s)
 {
-    s->data_store = fopen((const char*)s->storefile, "wb");
-    if (!s->data_store) {
+    char raw[512], mid[512];
+    snprintf(raw, sizeof(raw), "%s/CQT.txt", s->storefile);
+    snprintf(mid, sizeof(mid), "%s/CQT_12bpo.txt", s->storefile);
+    s->data_store = fopen(raw, "wb");
+    s->midi_data_store = fopen(mid, "wb");
+    if (!s->data_store || !s->midi_data_store) {
         av_log(s->ctx, AV_LOG_ERROR, "Could not initialize a file pointer; not recording data \n");
         return AVERROR(ENOMEM);
     }
@@ -1154,15 +1160,19 @@ static void process_cqt(ShowCQTContext *s)
     }
 }
 
+
 static void pre_process_cqt(ShowCQTContext* s)
 {
     int num_sign = 0;
     static int* last_sign_bit;
     int* current_signs;
+    double* mdi_ints;
+    long num_mid_bins;
     if(!last_sign_bit)
         last_sign_bit = av_calloc(s->cqt_len, sizeof(*last_sign_bit));
     current_signs = av_calloc(s->cqt_len, sizeof(*current_signs));
-
+    num_mid_bins = lrint(midi(s->ctx, s->freq[s->cqt_len - 1]));
+    mdi_ints = av_calloc(num_mid_bins, sizeof(*mdi_ints));
     for (int i = 1; i < s->cqt_len; ++i) {
         double magnitude = sqrtf(
                 s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
@@ -1191,7 +1201,98 @@ static void pre_process_cqt(ShowCQTContext* s)
     else {
         last_sign_bit = current_signs;
     }
+
+    for(int i = 0; i < s->cqt_len; ++i)
+    {
+        long midi_index = lrint(midi(s->ctx, s->freq[i]));
+        double magnitude = sqrtf(s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+        mdi_ints[midi_index] += magnitude;
+
+    }
+
+    double max_mdi = 0.0, sec_mdi= 0.0, third_mdi = 0.0;
+    int max_ind = -1, sec_ind = -1, thr_ind = -1;
+    for(int k = 0; k < num_mid_bins; ++k)
+    {
+        if(mdi_ints[k] > max_mdi) {
+            max_mdi = mdi_ints[k];
+            max_ind = k;
+        }
+
+        if(mdi_ints[k] > sec_mdi && mdi_ints[k] != max_mdi) {
+            sec_mdi = mdi_ints[k];
+            sec_ind = k;
+        }
+        if(mdi_ints[k] > third_mdi && !(mdi_ints[k] == max_mdi || mdi_ints[k] == sec_mdi)) {
+            third_mdi = mdi_ints[k];
+            thr_ind = k;
+        }
+
+    }
+    int primero = -1;
+
+
+    if(s->midi_data_store) {
+
+        fprintf(s->midi_data_store, "%d\t%d\t%d\n", max_ind, sec_ind, thr_ind);
+    }
+
+    if (abs(max_ind - sec_ind) % 12 == 0 || abs(max_ind - sec_ind) == 7 ||
+        abs(sec_ind - thr_ind) % 12 == 0 || abs(sec_ind - thr_ind) == 7 ||
+        abs(max_ind - thr_ind) % 12 == 0 || abs(max_ind - thr_ind) == 7)
+    {
+
+
+        if(abs(max_ind - sec_ind) % 12 == 0 || abs(max_ind - sec_ind) == 7)
+        {
+            primero = (abs(max_ind - thr_ind) > abs(sec_ind - thr_ind)) ? sec_ind : max_ind;
+        }
+        else if (abs(sec_ind - thr_ind) % 12 == 0 || abs(sec_ind - thr_ind) == 7)
+        {
+            primero = (abs(sec_ind - max_ind) > (thr_ind - max_ind)) ? thr_ind : sec_ind;
+        }
+        else if (abs(max_ind - thr_ind) % 12 == 0 || abs(max_ind - thr_ind) == 7)
+        {
+            primero = (abs(max_ind - sec_ind) > abs(thr_ind - sec_ind)) ? thr_ind : max_ind;
+        }
+
+//        av_log(s->ctx, AV_LOG_INFO, "Prime Midi: %d \n", primero);
+
+
+    }
+
+#define MIN(a, b, c) \
+    ({  __typeof__(a) _a = a; \
+        __typeof__(b) _b = b; \
+        __typeof__(c) _c = c; \
+        __typeof__(c) tmp1, tmp2; \
+        tmp1  = _a > _b ? _b : _a; \
+        tmp2 = _a > _c ? _c : _a; \
+        tmp1 > tmp2 ? tmp2 : tmp1; })
+
+    primero = MIN(max_ind, sec_ind, thr_ind);
+
+//    else {
+//        if (s->midi_data_store )
+//            fprintf(s->midi_data_store, "%d\t%d\t%d\n", 0, 0, 0);
+//    }
+
+    if(primero != -1)
+    {
+        for(int k = 0; k < s->cqt_len; ++k)
+        {
+            long mid_idx = lrint(midi(s->ctx, s->freq[k]));
+            if(mid_idx == primero)
+            {
+                s->cqt_result[k].re *= 256;
+                s->cqt_result[k].im *= 256;
+            }
+        }
+
+    }
+
 }
+
 
 static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
 {
@@ -1483,6 +1584,7 @@ static int config_output(AVFilterLink *outlink)
 
     common_uninit(s);
 
+
     outlink->w = s->width;
     outlink->h = s->height;
     s->format = outlink->format;
@@ -1628,8 +1730,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             if (out)
                 return ff_filter_frame(outlink, out);
         }
-        if(!s->no_data)
+        if(!s->no_data) {
             fclose(s->data_store);
+            fclose(s->midi_data_store);
+        }
         return AVERROR_EOF;
     }
 
@@ -1649,6 +1753,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             {
                 double timestamp = (double) (frame_idx * insamples->nb_samples + i) /  insamples->sample_rate;
                 fprintf(s->data_store, "%lf\t", timestamp);
+                fprintf(s->midi_data_store, "%lf\t", timestamp);
             }
             ret = plot_cqt(ctx, &out);
             if (ret < 0) {
