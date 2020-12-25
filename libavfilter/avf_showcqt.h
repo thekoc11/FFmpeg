@@ -30,6 +30,12 @@ typedef struct Coeffs {
     int start, len;
 } Coeffs;
 
+typedef struct Note {
+    uint16_t octave;
+    char note_id;
+    char accent;
+}Note;
+
 typedef struct RGBFloat {
     float r, g, b;
 } RGBFloat;
@@ -63,6 +69,8 @@ typedef struct ShowCQTContext {
     FFTComplex          *fft_data;
     FFTComplex          *fft_result;
     FFTComplex          *cqt_result;
+    FFTComplex          *cqt_result_12bpo;
+    double              *data_cache[150];
     float               *attack_data;
     int                 fft_bits;
     int                 fft_len;
@@ -76,7 +84,9 @@ typedef struct ShowCQTContext {
     float               cmatrix[3][3];
     float               cscheme_v[6];
     FILE*               data_store;
+    FILE*               data12bpo_store;
     FILE*               midi_data_store;
+    int                 *midi_buffer;
     /* callback */
     void                (*cqt_calc)(FFTComplex *dst, const FFTComplex *src, const Coeffs *coeffs,
                                     int len, int fft_len);

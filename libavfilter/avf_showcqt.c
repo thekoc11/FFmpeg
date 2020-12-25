@@ -60,6 +60,9 @@
 #define PTS_STEP 10
 #define PTS_TOLERANCE 1
 
+#define MIDI_BUFFER_SIZE 25
+#define DATA_CACHE_SIZE 150
+
 #define OFFSET(x) offsetof(ShowCQTContext, x)
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM)
 
@@ -112,6 +115,8 @@ static const AVOption showcqt_options[] = {
     { NULL }
 };
 
+static const char Note_names[] = {'C', 'D', 'E', 'F', 'G', 'A', 'B'};
+static const char Accents[] = {'#', '!'};
 
 AVFILTER_DEFINE_CLASS(showcqt);
 
@@ -166,6 +171,8 @@ static void common_uninit(ShowCQTContext *s)
     av_freep(&s->fft_data);
     av_freep(&s->fft_result);
     av_freep(&s->cqt_result);
+    av_freep(s->data_cache);
+    av_freep(&s->cqt_result_12bpo);
     av_freep(&s->attack_data);
     av_freep(&s->c_buf);
     av_freep(&s->h_buf);
@@ -239,11 +246,316 @@ static double c_weighting(void *p, double f)
 }
 
 
+
 static double midi(void *p, double f)
 {
     return log2(f/440.0) * 12.0 + 69.0;
 }
 
+static Note get_midi_info(void *p, int midi_idx)
+{
+    Note retPtr;
+    int n, series;
+    int note_idx;
+
+
+    n = midi_idx % 12;
+    series = (midi_idx / 12) - 1;
+
+    if(n < 7)
+        note_idx = (n % 2 == 0) ? n / 2 : (n + 1)/ 2;
+    else
+        note_idx = (n % 2 == 0) ? n / 2 + 1 : (n + 1) / 2;
+
+    /*
+     * n==0 : C : Notes[0]
+     * n==1 : D : accent ! Notes[1] Accents[1]
+     * n==2 : D : Notes[1]
+     * n==3 : E : ! Notes[2] Accents[1]
+     * n==4 : E : Notes[2]
+     * n==5 : F : Notes[3]
+     * n==6 : F : # Notes[3] Accents[0]
+     * n==7 : G : Notes[4]
+     * n==8 : A : ! Notes[5] Accents[1]
+     * n==9 : A : Notes[5]
+     * n==10: B : ! Notes[6] Accents[1]
+     * n==11: B : Notes[6]
+     * */
+
+    retPtr.octave = series;
+    retPtr.note_id = Note_names[note_idx];
+    if(n == 1 || n == 3 || n == 8 || n == 10)
+        retPtr.accent = Accents[1];
+    else if (n == 6)
+        retPtr.accent = Accents[0];
+    else
+        retPtr.accent = ' ';
+
+    return retPtr;
+}
+
+static int add_in_buffer(ShowCQTContext *s, int midi_idx, const double* midi_data, size_t midi_length)
+{
+    static int idx = 0;
+    if(idx >= MIDI_BUFFER_SIZE)
+    {
+
+//        av_log(s->ctx, AV_LOG_INFO, "Rearranging buffers and adding data \n");
+
+        for(int i = MIDI_BUFFER_SIZE - 1; i > 0; --i)
+        {
+            s->midi_buffer[i] = s->midi_buffer[i - 1];
+            for(int k = 0; k < midi_length; ++k)
+            {
+                s->data_cache[k][i] = s->data_cache[k][i-1];
+            }
+
+        }
+
+
+        s->midi_buffer[0] = midi_idx;
+        for(int i = 0; i < midi_length; ++i)
+        {
+            s->data_cache[i][0] = midi_data[i];
+        }
+//        av_log(s->ctx, AV_LOG_INFO, "Buffer modification successful\n");
+
+
+    }
+    else {
+        s->midi_buffer[idx] = midi_idx;
+        for(int i = 0; i < midi_length; ++i)
+        {
+            s->data_cache[i][idx] = midi_data[i];
+        }
+//        av_log(s->ctx, AV_LOG_INFO, "Adding data %d to buffer\n", idx);
+    }
+    ++idx;
+
+    return idx;
+
+}
+/*
+
+static int get_buffer_mode(ShowCQTContext *s, int idx, double* midi_data, int length)
+{
+    int midi_note_occurrences[256];
+    long num_cols;
+    int max_occurrences = -1, max_occuring_idx = -1;
+
+    if(idx <= MIDI_BUFFER_SIZE)
+        return -1;
+
+    num_cols = lrint(midi(s->ctx, s->freq[s->cqt_len - 1]));
+
+    for(int i = 0; i < num_cols; ++i)
+        midi_note_occurrences[i] = 0;
+
+    for(int i = 0; i < MIDI_BUFFER_SIZE; ++i)
+    {
+        for(int j = 0; j < length; ++j)
+        {
+            if(s->data_cache[j][i] > 0.5)
+                ++midi_note_occurrences[j];
+        }
+    }
+
+
+    for(int i = 0; i < num_cols; ++i)
+    {
+        if(midi_note_occurrences[i] > max_occurrences)
+        {
+            max_occurrences = midi_note_occurrences[i];
+            max_occuring_idx = i;
+        }
+    }
+
+    for(int i = 0; i < length; ++i)
+    {
+        double multiplier = (double)(midi_note_occurrences[i]) / midi_note_occurrences[max_occuring_idx];
+        midi_data[i] = multiplier;
+    }
+
+//    free(midi_note_occurrences);
+//    av_log(s->ctx, AV_LOG_INFO, "Buffer mode %d\n", max_occuring_idx);
+    return max_occuring_idx;
+
+}
+
+static int get_dominant_series(ShowCQTContext *s, int idx)
+{
+    int* o_start;
+    int* prob_start;
+    int size = 0;
+    int dom_oct = -1;
+    int max_prob = -1;
+
+
+
+    if(idx <= MIDI_BUFFER_SIZE)
+        return -1;
+
+    o_start = av_malloc_array(MIDI_BUFFER_SIZE, sizeof(*o_start));
+    prob_start = av_malloc_array(MIDI_BUFFER_SIZE, sizeof(*prob_start));
+
+    for(int i = 0; i < MIDI_BUFFER_SIZE; ++i)
+    {
+        int oct = get_midi_info(s, s->midi_buffer[i]).octave;
+        int found = -1;
+        if(size > 0)
+        {
+            for (int j = 0; j < size; ++j) {
+                if (oct == o_start[j]) {
+                    prob_start[j]++;
+                    found = 1;
+                } else {
+                    found = 0;
+                }
+
+            }
+        }
+        if(found < 1)
+        {
+            o_start[size] = oct;
+            prob_start[size] = 1;
+            ++size;
+        }
+
+    }
+
+    for(int i = 0; i < size; ++i)
+    {
+        if (prob_start[i] > max_prob)
+        {
+            max_prob = prob_start[i];
+            dom_oct = o_start[i];
+        }
+    }
+
+    av_freep(&o_start);
+    av_freep(&prob_start);
+
+    return dom_oct;
+}
+*/
+
+static int get_dominant_note(ShowCQTContext *s, int idx, const double* midi_data, double** midi_multiplier, size_t length, int midi_start_idx)
+{
+    int note_occurrences[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    int num_series[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    int max_occurrences = -1, mas_s_occurrences = -1;
+    int dom_note = -1;
+    int dom_series = -1;
+    double *multiplier = *midi_multiplier;
+    if(idx <= MIDI_BUFFER_SIZE)
+        return -1;
+
+
+
+    for(int i = midi_start_idx; i < length; ++i)
+    {
+        Note curr_mid_info = get_midi_info(s->ctx, i);
+        char curr_note = curr_mid_info.note_id;
+        int note_idx;
+        for(int k = 0; k < 7; ++k)
+        {
+            if(curr_note == Note_names[k])
+                note_idx = k;
+        }
+        if(midi_data[i] >= 0.5)
+        {
+            note_occurrences[note_idx]++;
+        }
+    }
+
+    for(int j = 0; j < MIDI_BUFFER_SIZE; ++j)
+    {
+        for(int k = midi_start_idx; k < length; ++k)
+        {
+            uint16_t curr_series = get_midi_info(s->ctx, k).octave;
+            if(s->data_cache[k][j] > 0.5)
+            {
+                ++num_series[curr_series];
+            }
+        }
+    }
+
+    for(int k = 0; k < 16; ++k)
+    {
+        if(note_occurrences[k] > max_occurrences){
+            max_occurrences = note_occurrences[k];
+            dom_note = k;
+        }
+        if(num_series[k] > mas_s_occurrences){
+            mas_s_occurrences = num_series[k];
+            dom_series = k;
+        }
+    }
+
+    for(int i = midi_start_idx; i < length; ++i)
+    {
+        Note curr_mid_info = get_midi_info(s->ctx, i);
+        char curr_note = curr_mid_info.note_id;
+        uint16_t curr_series = curr_mid_info.octave;
+        int note_idx;
+        double note_mul = 1;
+        double oct_mul = 1;
+        for(int k = 0; k < 7; ++k)
+        {
+            if(curr_note == Note_names[k])
+                note_idx = k;
+        }
+        if(max_occurrences > 0)
+        {
+           note_mul = pow((double)note_occurrences[note_idx] / max_occurrences, 32);
+        }
+
+        if(mas_s_occurrences > 0)
+        {
+//            av_log(s->ctx, AV_LOG_INFO, "i %d series %d current series occurrences = %d, max series occurrences = %d\n", i , curr_series, num_series[curr_series], mas_s_occurrences);
+
+            oct_mul = pow((double)num_series[curr_series] / mas_s_occurrences, 2);
+        }
+
+        multiplier[i] = note_mul * oct_mul;
+//        av_log(s->ctx, AV_LOG_INFO, "Multiplier Value for %d is %lf %lf %d %d\n", i, midi_multiplier[i], note_mul, max_occurrences, mas_s_occurrences);
+
+    }
+
+//    av_log(s->ctx, AV_LOG_INFO, "Dominant octave: %d Max occurrences %d \n", dom_series, mas_s_occurrences);
+
+
+    return (dom_series + 1)*12 + dom_note;
+}
+/*
+
+static int refine_midi(void *p, int idx, int dom_oct)
+{
+    int dom_mid, infimum, supremum;
+    int ret;
+    dom_mid = (dom_oct + 1) * 12;
+//    infimum = dom_mid - 5;
+//    supremum = dom_mid + 7;
+
+    if(dom_oct == -1)
+        return idx;
+
+    if(idx > infimum && idx < supremum)
+    {
+        ret = idx;
+    }
+    else if(idx < infimum)
+    {
+        ret = idx + 12;
+    }
+    else if(idx > supremum)
+    {
+        ret = idx - 12;
+    }
+
+    return ret;
+}
+*/
 
 static int init_volume(ShowCQTContext *s)
 {
@@ -285,6 +597,53 @@ error:
     av_expr_free(sono);
     av_expr_free(bar);
     return ret;
+}
+
+static int init_midi_buffer(ShowCQTContext *s)
+{
+    int x, ret = AVERROR(ENOMEM);
+
+    s->midi_buffer = av_malloc_array(MIDI_BUFFER_SIZE, sizeof(*s->midi_buffer));
+    if(!s->midi_buffer)
+        goto error;
+
+    for(x = 0; x < MIDI_BUFFER_SIZE; x++){
+        s->midi_buffer[x] = -1;
+    }
+
+    av_log(s->ctx, AV_LOG_INFO, "Midi Buffer initialized index %d value %d\n", MIDI_BUFFER_SIZE-1, s->midi_buffer[MIDI_BUFFER_SIZE - 1]);
+
+    return 0;
+error:
+    av_freep(&s->midi_buffer);
+    return ret;
+}
+
+static int init_data_cache(ShowCQTContext *s)
+{
+    int x, ret = AVERROR(ENOMEM), i;
+//    av_log(s->ctx, AV_LOG_INFO, "Trying to initialize data cache!!\n");
+    for (i = 0; i < DATA_CACHE_SIZE; ++i)
+    {
+        s->data_cache[i] = av_malloc_array(MIDI_BUFFER_SIZE, sizeof(*s->data_cache[i]));
+        if(!s->data_cache[i])
+            goto error;
+
+        for(x = 0; x < MIDI_BUFFER_SIZE; x++)
+        {
+//            av_log(s->ctx, AV_LOG_INFO, "initing data cache %d %d !!\n", i, x);
+
+            s->data_cache[i][x] = 0.0;
+
+        }
+    }
+    av_log(s->ctx, AV_LOG_INFO, "data cache initialized!!\n");
+
+    return 0;
+error:
+        av_freep(&s->data_cache);
+    return ret;
+
 }
 
 static void cqt_calc(FFTComplex *dst, const FFTComplex *src, const Coeffs *coeffs,
@@ -361,7 +720,7 @@ static int init_cqt(ShowCQTContext *s)
 
         if (s->permute_coeffs)
             s->permute_coeffs(s->coeffs[m].val, s->coeffs[m].len);
-        av_log(s->ctx, AV_LOG_INFO, "flen %.3lf, center %.3lf, tlength %.3lf, frequency %3lf index %d midi %.3lf\n", flen, center, tlength, s->freq[k], k, midi(s->ctx, s->freq[k]));
+//        av_log(s->ctx, AV_LOG_INFO, "flen %.3lf, center %.3lf, tlength %.3lf, frequency %3lf index %d midi %.3lf\n", flen, center, tlength, s->freq[k], k, midi(s->ctx, s->freq[k]));
     }
 
     av_expr_free(expr);
@@ -455,12 +814,14 @@ error:
 
 static int init_data_store(struct ShowCQTContext *s)
 {
-    char raw[512], mid[512];
+    char raw[512], mid[512], raw12[512];
     snprintf(raw, sizeof(raw), "%s/CQT.txt", s->storefile);
-    snprintf(mid, sizeof(mid), "%s/CQT_12bpo.txt", s->storefile);
+    snprintf(raw12, sizeof(raw12), "%s/transformed.txt", s->storefile);
+    snprintf(mid, sizeof(mid), "%s/melody.txt", s->storefile);
     s->data_store = fopen(raw, "wb");
+    s->data12bpo_store = fopen(raw12, "wb");
     s->midi_data_store = fopen(mid, "wb");
-    if (!s->data_store || !s->midi_data_store) {
+    if (!s->data_store || !s->midi_data_store || !s->data12bpo_store) {
         av_log(s->ctx, AV_LOG_ERROR, "Could not initialize a file pointer; not recording data \n");
         return AVERROR(ENOMEM);
     }
@@ -1168,18 +1529,55 @@ static void pre_process_cqt(ShowCQTContext* s)
     int* current_signs;
     double* mdi_ints;
     long num_mid_bins;
-    if(!last_sign_bit)
-        last_sign_bit = av_calloc(s->cqt_len, sizeof(*last_sign_bit));
-    current_signs = av_calloc(s->cqt_len, sizeof(*current_signs));
+    double* mdi_multiplier;
+    int primero = -1;
+    int prim_note = -1;
+    int frame_idx = -1;
+    double max_mdi = 0.0, sec_mdi= 0.0, third_mdi = 0.0;
+    int max_ind = -1, sec_ind = -1, thr_ind = -1;
+    int a, b, c, final;
+    uint16_t mdi_idx_start = lrint(midi(s->ctx, s->freq[0]));
+
     num_mid_bins = lrint(midi(s->ctx, s->freq[s->cqt_len - 1]));
-    mdi_ints = av_calloc(num_mid_bins, sizeof(*mdi_ints));
+
+    mdi_ints = av_calloc(256, sizeof(*mdi_ints));
+    mdi_multiplier = av_malloc_array(256, sizeof(*mdi_multiplier));
+    if(!last_sign_bit)
+        last_sign_bit = av_calloc(256, sizeof(*last_sign_bit));
+    current_signs = av_malloc_array(256, sizeof(*current_signs));
+
+    for(int i = 0; i < num_mid_bins; ++i)
+    {
+        mdi_ints[i] = 0;
+        mdi_multiplier[i] = 1;
+    }
+
+    //// Remove the low significance values
     for (int i = 1; i < s->cqt_len; ++i) {
         double magnitude = sqrtf(
                 s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
-        if( /*i <= 583 ||*/ magnitude <= 0.005)
+        if( /*i <= 583 ||*/ magnitude <= 0.001)
         {
             s->cqt_result[i].re = 0;
             s->cqt_result[i].im = 0;
+        }
+    }
+
+    //// Find intensity for every bin @ 12 bins per octave
+    for(int i = 0; i < s->cqt_len; ++i)
+    {
+        long midi_index = lrint(midi(s->ctx, s->freq[i]));
+        double magnitude = sqrtf(s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+        mdi_ints[midi_index] += magnitude;
+        mdi_multiplier[midi_index] = 1;
+
+    }
+    //// Nullify midi bins with intensities less than a given threshold (here 0.1)
+    for (int i = 0; i  < num_mid_bins; ++i)
+    {
+        double magnitude = mdi_ints[i];
+        if( magnitude <= 0.07)
+        {
             current_signs[i] = 0;
         }else{
             current_signs[i] = 1;
@@ -1187,11 +1585,23 @@ static void pre_process_cqt(ShowCQTContext* s)
         }
     }
 
-    if(num_sign > 300)
+    for(int i = 0; i < s->cqt_len; ++i)
+    {
+        long midi_idx = lrint(midi(s->ctx, s->freq[i]));
+        if(current_signs[midi_idx] == 0)
+        {
+            s->cqt_result[i].re = 0;
+            s->cqt_result[i].im = 0;
+        }
+    }
+
+    //// More than two octaves of signoficant midi data suggests a rhythimic element. In that case, only keep the bins that were significant in the last frame
+    if(num_sign > 24)
     {
         for(int i = 0; i < s->cqt_len; ++i)
         {
-            if(last_sign_bit[i] != 1)
+            long midi_idx = lrint(midi(s->ctx, s->freq[i]));
+            if(last_sign_bit[midi_idx] != 1)
             {
                 s->cqt_result[i].re = 0;
                 s->cqt_result[i].im = 0;
@@ -1202,6 +1612,7 @@ static void pre_process_cqt(ShowCQTContext* s)
         last_sign_bit = current_signs;
     }
 
+    //// Recalculate intensities for every midi bin after re-caliberating the cqt results
     for(int i = 0; i < s->cqt_len; ++i)
     {
         long midi_index = lrint(midi(s->ctx, s->freq[i]));
@@ -1210,8 +1621,9 @@ static void pre_process_cqt(ShowCQTContext* s)
 
     }
 
-    double max_mdi = 0.0, sec_mdi= 0.0, third_mdi = 0.0;
-    int max_ind = -1, sec_ind = -1, thr_ind = -1;
+
+
+//// Relatives of the primary octave get preference over other notes, depending upon the data cache
     for(int k = 0; k < num_mid_bins; ++k)
     {
         if(mdi_ints[k] > max_mdi) {
@@ -1229,37 +1641,8 @@ static void pre_process_cqt(ShowCQTContext* s)
         }
 
     }
-    int primero = -1;
 
-
-    if(s->midi_data_store) {
-
-        fprintf(s->midi_data_store, "%d\t%d\t%d\n", max_ind, sec_ind, thr_ind);
-    }
-
-    if (abs(max_ind - sec_ind) % 12 == 0 || abs(max_ind - sec_ind) == 7 ||
-        abs(sec_ind - thr_ind) % 12 == 0 || abs(sec_ind - thr_ind) == 7 ||
-        abs(max_ind - thr_ind) % 12 == 0 || abs(max_ind - thr_ind) == 7)
-    {
-
-
-        if(abs(max_ind - sec_ind) % 12 == 0 || abs(max_ind - sec_ind) == 7)
-        {
-            primero = (abs(max_ind - thr_ind) > abs(sec_ind - thr_ind)) ? sec_ind : max_ind;
-        }
-        else if (abs(sec_ind - thr_ind) % 12 == 0 || abs(sec_ind - thr_ind) == 7)
-        {
-            primero = (abs(sec_ind - max_ind) > (thr_ind - max_ind)) ? thr_ind : sec_ind;
-        }
-        else if (abs(max_ind - thr_ind) % 12 == 0 || abs(max_ind - thr_ind) == 7)
-        {
-            primero = (abs(max_ind - sec_ind) > abs(thr_ind - sec_ind)) ? thr_ind : max_ind;
-        }
-
-//        av_log(s->ctx, AV_LOG_INFO, "Prime Midi: %d \n", primero);
-
-
-    }
+//    av_log(s->ctx, AV_LOG_INFO, "signidficant notes computeed!! linex 1476 reached!!\n");
 
 #define MIN(a, b, c) \
     ({  __typeof__(a) _a = a; \
@@ -1269,27 +1652,127 @@ static void pre_process_cqt(ShowCQTContext* s)
         tmp1  = _a > _b ? _b : _a; \
         tmp2 = _a > _c ? _c : _a; \
         tmp1 > tmp2 ? tmp2 : tmp1; })
+//
+//    primero = MIN(max_ind, sec_ind, thr_ind);
 
-    primero = MIN(max_ind, sec_ind, thr_ind);
+    primero = max_ind;
+
+    if (thr_ind == -1)
+        primero = max_ind < sec_ind ? max_ind : sec_ind;
+    if(sec_ind == -1)
+        primero = max_ind;
+
+    if(abs(max_ind - sec_ind) % 12 == 0 || abs(max_ind - sec_ind) == 7 || abs(max_ind - sec_ind) == 5)
+        primero = (abs(max_ind - thr_ind) < abs(max_ind - sec_ind)) ? max_ind : sec_ind;
+    else if(abs(thr_ind - sec_ind) % 12 == 0 || abs(thr_ind - sec_ind) == 7 || abs(thr_ind - sec_ind) == 5)
+        primero = (abs(max_ind - thr_ind) < abs(max_ind - sec_ind)) ? thr_ind : sec_ind;
+    else if(abs(thr_ind - max_ind) % 12 == 0 || abs(thr_ind - max_ind) == 7 || abs(thr_ind - max_ind) == 5)
+        primero = (abs(sec_ind - thr_ind) < abs(max_ind - sec_ind)) ? thr_ind : max_ind;
+
 
 //    else {
 //        if (s->midi_data_store )
 //            fprintf(s->midi_data_store, "%d\t%d\t%d\n", 0, 0, 0);
 //    }
+    frame_idx = add_in_buffer(s, primero, mdi_ints, num_mid_bins);
+    prim_note = get_dominant_note(s, frame_idx, mdi_ints, &mdi_multiplier, num_mid_bins, mdi_idx_start);
 
-    if(primero != -1)
+
+    a = abs(max_ind - prim_note);
+    b = abs(sec_ind - prim_note);
+    c = abs(thr_ind - prim_note);
+
+    final = MIN(a, b, c);
+
+    primero = final + prim_note;
+
+//    if(primero == max_ind)
+//    {
+//        primero_h1 = max_ind_h1;
+//        primero_h2 = max_ind_h2;
+//    }
+//    else if(primero == sec_ind)
+//    {
+//        primero_h1 = sec_ind_h1;
+//        primero_h2 = sec_ind_h2;
+//    }
+//    else if(primero == thr_ind)
+//    {
+//        primero_h1 = thr_ind_h1;
+//        primero_h2 = thr_ind_h2;
+//    }
+
+    if(frame_idx > MIDI_BUFFER_SIZE)
     {
         for(int k = 0; k < s->cqt_len; ++k)
         {
             long mid_idx = lrint(midi(s->ctx, s->freq[k]));
+            s->cqt_result[k].re *= mdi_multiplier[mid_idx];
+            s->cqt_result[k].im *= mdi_multiplier[mid_idx];
             if(mid_idx == primero)
             {
-                s->cqt_result[k].re *= 256;
-                s->cqt_result[k].im *= 256;
+                s->cqt_result[k].re *= 8;
+                s->cqt_result[k].im *= 8;
             }
+        }
+    }
+/*
+//    if(num_sign > 12) {
+//        for(int k = 0; k < s->cqt_len; ++k)
+//        {
+//
+//            double magnitude = sqrtf(s->cqt_result[k].re * s->cqt_result[k].re + s->cqt_result[k].im * s->cqt_result[k].im);
+//            if(magnitude < 1)
+//            {
+//                s->cqt_result[k].re *= 0;
+//                s->cqt_result[k].im *= 0;
+//
+//            }
+//
+//        }
+//    }
+//    else
+//    {
+//
+//    }
+        av_log(s->ctx, AV_LOG_INFO, "Current midi: %d: dominant octave %d current octave %d\n", primero, dom_oct, currMidData.octave);
+//*/
+    //// Recalculate intensities for every midi bin after re-caliberating the cqt results
+    for(int i = 0; i < s->cqt_len; ++i)
+    {
+        long midi_index = lrint(midi(s->ctx, s->freq[i]));
+        double magnitude = sqrtf(s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+        mdi_ints[midi_index] += magnitude;
+
+    }
+
+    //// Recalculate the max, second max and third max intensities
+    for(int k = 0; k < num_mid_bins; ++k)
+    {
+        if(mdi_ints[k] > max_mdi) {
+            max_mdi = mdi_ints[k];
+            max_ind = k;
+        }
+
+        if(mdi_ints[k] > sec_mdi && mdi_ints[k] != max_mdi) {
+            sec_mdi = mdi_ints[k];
+            sec_ind = k;
+        }
+        if(mdi_ints[k] > third_mdi && !(mdi_ints[k] == max_mdi || mdi_ints[k] == sec_mdi)) {
+            third_mdi = mdi_ints[k];
+            thr_ind = k;
         }
 
     }
+
+    if(s->midi_data_store) {
+
+        fprintf(s->midi_data_store, "%d\t%d\t%d\t%d\n", primero, max_ind, sec_ind, thr_ind);
+    }
+
+    av_freep(&mdi_multiplier);
+    av_freep(&mdi_ints);
+    av_freep(&current_signs);
 
 }
 
@@ -1300,13 +1783,13 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
     ShowCQTContext *s = ctx->priv;
     int64_t last_time, cur_time;
 
-
 #define UPDATE_TIME(t) \
     cur_time = av_gettime(); \
-    t += cur_time - last_time; \
+    (t) += cur_time - last_time; \
     last_time = cur_time
 
     last_time = av_gettime();
+
 
     memcpy(s->fft_result, s->fft_data, s->fft_len * sizeof(*s->fft_data));
     if (s->attack_data) {
@@ -1317,10 +1800,22 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
         }
     }
 
+
+
     av_fft_permute(s->fft_ctx, s->fft_result);
     av_fft_calc(s->fft_ctx, s->fft_result);
     s->fft_result[s->fft_len] = s->fft_result[0];
     UPDATE_TIME(s->fft_time);
+
+    if(s->cqt_result_12bpo)
+    {
+        for(int i = 0; i < lrint(midi(s->ctx, s->freq[s->cqt_len - 1])); ++i)
+        {
+            s->cqt_result_12bpo[i].re = 0;
+            s->cqt_result_12bpo[i].im = 0;
+        }
+    }
+
 
     s->cqt_calc(s->cqt_result, s->fft_result, s->coeffs, s->cqt_len, s->fft_len);
     UPDATE_TIME(s->cqt_time);
@@ -1329,54 +1824,31 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
 
         pre_process_cqt(s);
         UPDATE_TIME(s->pre_process_cqt_time);
-/*
-        // *  Only Max intensity display:
-        double max_mag = sqrtf(s->cqt_result[0].re * s->cqt_result[0].re + s->cqt_result[0].im * s->cqt_result[0].im);
-        int max_max_index = 0;
-        for (int i = 1; i < s->cqt_len; ++i) {
-            double magnitude = sqrtf(
-                    s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
-            if(magnitude >= max_mag)
-            {
-                max_mag = magnitude;
-                max_max_index  = i;
-            }
-        }
-        for(int i = 0; i < s->cqt_len; ++i)
-        {
-            if(i != max_max_index)
-            {
-                s->cqt_result[i].re = 0;
-                s->cqt_result[i].im = 0;
-            }
-        }*/
-//        av_log(s->ctx, AV_LOG_INFO, "Frame for cqt time %ld, index %ld\n", last_time, ++idx);
-
-
-/*
-        else {
-            for(int i = 0; i < s->cqt_len; ++i)
-                last_sign_bit[i] = s->cqt_result[i];
-        }
-*/
 
         process_cqt(s);
         UPDATE_TIME(s->process_cqt_time);
 
-/*
-
-        int* counts = (int*)av_calloc(s->cqt_len, sizeof (int));
-        for(int i = 0 ; i < s->cqt_len; ++i)
-            counts[i] = 0;
-*/
     if(s->data_store)
     {
         for (int i = 0; i < s->cqt_len; ++i) {
+            long midi_index = lrint(midi(s->ctx, s->freq[i]));
             double magnitude = sqrtf(
                     s->cqt_result[i].re * s->cqt_result[i].re + s->cqt_result[i].im * s->cqt_result[i].im);
+            s->cqt_result_12bpo[midi_index].re += s->cqt_result[i].re;
+            s->cqt_result_12bpo[midi_index].im += s->cqt_result[i].im;
             fprintf(s->data_store, "%lf\t", magnitude);
         }
         fprintf(s->data_store, "\n");
+    }
+    if(s->data12bpo_store)
+    {
+        long num_cols = lrint(midi(s->ctx, s->freq[s->cqt_len - 1]));
+        for (int i = 0; i < num_cols; ++i) {
+            double magnitude = sqrtf(
+                    s->cqt_result_12bpo[i].re * s->cqt_result_12bpo[i].re + s->cqt_result_12bpo[i].im * s->cqt_result_12bpo[i].im);
+            fprintf(s->data12bpo_store, "%lf\t", magnitude);
+        }
+        fprintf(s->data12bpo_store, "\n");
     }
 
     if(!s->no_video) {
@@ -1414,6 +1886,9 @@ static int plot_cqt(AVFilterContext *ctx, AVFrame **frameout)
         s->sono_count = (s->sono_count + 1) % s->count;
         if (s->sono_h)
             s->sono_idx = (s->sono_idx + s->sono_h - 1) % s->sono_h;
+    }
+    else{
+
     }
     return 0;
 }
@@ -1490,6 +1965,7 @@ static av_cold int init(AVFilterContext *ctx)
         s->height /= 2;
         s->fullhd = 1;
     }
+
 
     if(!s->no_data)
         init_data_store(s);
@@ -1601,6 +2077,11 @@ static int config_output(AVFilterLink *outlink)
 
     if ((ret = init_volume(s)) < 0)
         return ret;
+    if((ret = init_data_cache(s)) < 0)
+        return ret;
+
+    if((ret = init_midi_buffer(s)) < 0)
+        return ret;
 
     s->fft_bits = FFMAX(ceil(log2(inlink->sample_rate * s->timeclamp)), 4);
     s->fft_len = 1 << s->fft_bits;
@@ -1610,8 +2091,10 @@ static int config_output(AVFilterLink *outlink)
     s->fft_data = av_calloc(s->fft_len, sizeof(*s->fft_data));
     s->fft_result = av_calloc(s->fft_len + 64, sizeof(*s->fft_result));
     s->cqt_result = av_malloc_array(s->cqt_len, sizeof(*s->cqt_result));
+    s->cqt_result_12bpo = av_malloc_array(lrint(midi(s->ctx, s->freq[s->cqt_len - 1])), sizeof(*s->cqt_result_12bpo));
     if (!s->fft_ctx || !s->fft_data || !s->fft_result || !s->cqt_result)
         return AVERROR(ENOMEM);
+
 
     s->remaining_fill_max = s->fft_len / 2;
     if (s->attack > 0.0) {
@@ -1732,12 +2215,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
         }
         if(!s->no_data) {
             fclose(s->data_store);
+            fclose(s->data12bpo_store);
             fclose(s->midi_data_store);
         }
         return AVERROR_EOF;
     }
 
     remaining = insamples->nb_samples; ++frame_idx;
+    /*
+     * For some random frame in the middle of the song, output the number of samples per frame:
+     * */
+    if(frame_idx == 100)
+        av_log(s->ctx, AV_LOG_INFO, "num samples %d\n", insamples->nb_samples);
     audio_data = (float*) insamples->data[0];
 
     while (remaining) {
@@ -1753,6 +2242,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             {
                 double timestamp = (double) (frame_idx * insamples->nb_samples + i) /  insamples->sample_rate;
                 fprintf(s->data_store, "%lf\t", timestamp);
+                fprintf(s->data12bpo_store, "%lf\t", timestamp);
                 fprintf(s->midi_data_store, "%lf\t", timestamp);
             }
             ret = plot_cqt(ctx, &out);
