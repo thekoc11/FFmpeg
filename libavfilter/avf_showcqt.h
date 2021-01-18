@@ -87,6 +87,7 @@ typedef struct ShowCQTContext {
     FILE*               data12bpo_store;
     FILE*               midi_data_store;
     int                 *midi_buffer;
+    int64_t             frame_idx;
     /* callback */
     void                (*cqt_calc)(FFTComplex *dst, const FFTComplex *src, const Coeffs *coeffs,
                                     int len, int fft_len);
